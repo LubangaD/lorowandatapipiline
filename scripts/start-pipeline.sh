@@ -14,6 +14,6 @@ echo "Starting services with unique ID: $UNIQUE_ID"
 echo "This will ensure no container naming conflicts occur"
 
 # Run docker-compose with the unique ID
-docker-compose -f docker-compose.yml up --build
+docker-compose -f docker-compose.yml up -d --build
 
 # Note: Press Ctrl+C to stop all services when done

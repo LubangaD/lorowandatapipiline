@@ -1,23 +1,6 @@
 
 version: '3.8'
 services:
-  zookeeper:
-    image: confluentinc/cp-zookeeper:latest
-    container_name: imarika-zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-    - 2181:2181
-    networks:
-    - confluent
-    healthcheck:
-      test:
-      - CMD-SHELL
-      - echo srvr | nc localhost 2181 || exit 1
-      interval: 10s
-      timeout: 5s
-      retries: 5
   kafka-broker-1:
     image: confluentinc/cp-kafka:latest
     container_name: imarika-kafka-broker
@@ -25,19 +8,19 @@ services:
     ports:
     - 9092:9092
     - 19092:19092
-    depends_on:
-      zookeeper:
-        condition: service_healthy
+    - 9093:9093
     environment:
       KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: imarika-zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_PROCESS_ROLES: broker, controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-broker-1:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-broker-1:9092,PLAINTEXT_INTERNAL://kafka-broker-1:19092
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:19092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:19092,CONTROLLER://0.0.0.0:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      CLUSTER_ID: p2j7xq8XS0OKt_mHwo1QEA
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
     networks:
     - confluent
-    
     healthcheck:
       test:
       - CMD-SHELL
@@ -58,7 +41,6 @@ services:
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_LISTENERS: http://schema-registry:8081
-      SCHEMA_REGISTRY_KAFKASTORE_CONNECTION_URL: imarika-zookeeper:2181
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka-broker-1:19092
       SCHEMA_REGISTRY_DEBUG: 'true'
     networks:
@@ -125,7 +107,7 @@ services:
   spark-submit:
     build:
       context: .
-      dockerfile: Dockerfile.spark
+      dockerfile: docker/Dockerfile.spark
     container_name: imarika-spark-submit-${UNIQUE_ID}
     depends_on:
       kafka-broker-1:
@@ -141,10 +123,10 @@ services:
       - --master
       - spark://imarika-spark-master:7077
       - --packages
-      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0,org.postgresql:postgresql:42.5.1
+      - org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0,org.postgresql:postgresql:42.5.1
       - --conf
       - spark.jars.ivy=/tmp/.ivy
-      - /opt/spark-apps/weather_spark_processor.py
+      - /opt/spark-apps/src/weather_spark_processor.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka-broker-1:19092
       KAFKA_TOPIC_RAW: weather-readings-raw
@@ -159,7 +141,7 @@ services:
   producer:
     build:
       context: .
-      dockerfile: Dockerfile.producer
+      dockerfile: docker/Dockerfile.producer
     container_name: api_data_producer
     depends_on:
     - kafka-broker-1
@@ -168,22 +150,25 @@ services:
       EMAIL: derrick.lubanga@strathmore.edu
       PASSWORD: Expendables
     volumes:
-    - ./api_data_fetcher_kafka.py:/app/api_data_fetcher_kafka.py
+    - ./src:/app/src
     - ./requirements.txt:/app/requirements.txt
+    - ./config:/app/config
     networks:
     - confluent
+    restart: unless-stopped
   consumer:
     build:
       context: .
-      dockerfile: Dockerfile.consumer
+      dockerfile: docker/Dockerfile.consumer
     container_name: kafka_consumer
     depends_on:
     - kafka-broker-1
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka-broker-1:19092
     volumes:
-    - ./kafka_consumer.py:/app/kafka_consumer.py
+    - ./src:/app/src
     - ./requirements.txt:/app/requirements.txt
+    - ./config:/app/config
     networks:
     - confluent
 volumes:

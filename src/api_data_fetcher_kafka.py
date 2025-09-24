@@ -20,7 +20,7 @@ KAFKA_BOOTSTRAP_SERVERS = 'kafka-broker-1:19092'  # Replace with your Kafka brok
 KAFKA_TOPIC = 'weather-readings-raw'
 
 # Configuration for data fetching frequency
-DATA_FETCH_INTERVAL = 15 * 60  # 15 minutes
+DATA_FETCH_INTERVAL = 1 * 60  # 15 minutes
 TOKEN_REFRESH_INTERVAL = 3 * 60 * 60  # 3 hours
 
 def delivery_report(err, msg):
