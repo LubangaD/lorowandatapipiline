@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # """
 # IMARIKA Weather Data Processing Pipeline - Structured Streaming with foreachBatch
@@ -13,11 +12,14 @@ import logging
 import time
 import traceback
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, to_json, struct, lit, current_timestamp, date_format, unix_timestamp, when, to_timestamp
+from pyspark.sql.functions import col, from_json, to_json, struct, lit, current_timestamp, date_format, unix_timestamp, when, to_timestamp, to_date
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType, IntegerType, TimestampType
 from pyspark.ml.feature import Imputer, VectorAssembler, StandardScaler
 from pyspark.ml.clustering import KMeans
 from pyspark.sql.types import *
+from QC.qc_level_1 import *
+# from config.config import thr
+
 
 import pyspark.sql.functions as F
 
@@ -38,6 +40,8 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 POSTGRES_DRIVER = "org.postgresql.Driver"
 POSTGRES_TABLE_RAW = os.environ.get("POSTGRES_TABLE_RAW", "weather_raw")
 POSTGRES_TABLE_CLEAN = os.environ.get("POSTGRES_TABLE_CLEAN", "weather_clean")
+POSTGRES_TABLE_DAILY_AGG = os.environ.get("POSTGRES_TABLE_DAILY_AGG", "daily_agg")
+POSTGRES_TABLE_QC_AUDIT_LOG = os.environ.get("POSTGRES_TABLE_QC_AUDIT_LOG", "qc_audit_log")
 CHECKPOINT_LOCATION = os.environ.get("CHECKPOINT_LOCATION", "/tmp/imarika/checkpoints")
 MAX_OFFSETS_PER_TRIGGER = int(os.environ.get("MAX_OFFSETS_PER_TRIGGER", "1000"))
 
@@ -47,7 +51,7 @@ def create_spark_session():
     return (SparkSession.builder
             .appName("IMARIKA Weather Data Processor")
             .config("spark.jars.packages", \
-                    "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0,org.postgresql:postgresql:42.5.1")
+                    "org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0,org.postgresql:postgresql:42.5.1")
             .config("spark.sql.streaming.checkpointLocation", CHECKPOINT_LOCATION)
             .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true")
             .config("spark.executor.memory", "1g")
@@ -271,6 +275,31 @@ def detect_anomalies_simple(df):
         # Return DataFrame with default values if anomaly detection fails
         return df.withColumn("anomaly_score", lit(0.0)).withColumn("is_anomaly", lit(False))
 
+
+def prepare_weather_clean_from_stream(df_raw):
+    """
+    Convert Kafka/raw schema to flattened, typed DataFrame suitable for weather_clean table
+    """
+    df_flat = df_raw.select(
+        col("reading_id"),
+        col("device_id"),
+        col("reading.valid").alias("valid"),
+        col("reading.uv_index").cast(DoubleType()).alias("uv_index"),
+        col("reading.rain_gauge").cast(DoubleType()).alias("rain_gauge"),
+        col("reading.wind_speed").cast(DoubleType()).alias("wind_speed"),
+        col("reading.air_humidity").alias("air_humidity"),
+        col("reading.peak_wind_gust").alias("peak_wind_gust"),
+        col("reading.air_temperature").alias("air_temperature"),
+        col("reading.light_intensity").alias("light_intensity"),
+        col("reading.rain_accumulation").alias("rain_accumulation"),
+        col("reading.barometric_pressure").alias("barometric_pressure"),
+        col("reading.wind_direction_sensor").alias("wind_direction_sensor"),
+        to_timestamp(col("created_at"), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").alias("processing_timestamp")
+    )
+
+    return df_flat
+
+
 def aggregate_daily_data(df):
     """Aggregate cleaned & imputed data to daily metrics"""
     try:
@@ -283,7 +312,7 @@ def aggregate_daily_data(df):
         # Check if 'date' column exists, if not create it
         if "date" not in df.columns:
             logger.info("Date column not found, creating from processing_timestamp")
-            df = df.withColumn("date", date_format(col("processing_timestamp"), "yyyy-MM-dd"))
+            df = df.withColumn("date", to_date(col("processing_timestamp")).cast(DateType()))
         
         # Verify required columns exist
         required_cols = ["device_id", "date", "air_temperature", "wind_speed", "rain_gauge", 
@@ -342,7 +371,7 @@ def validate_data_quality(df, table_name):
             return False
             
         # Check for nulls in critical columns
-        if table_name == POSTGRES_TABLE_CLEAN:
+        if table_name == POSTGRES_TABLE_DAILY_AGG:
             null_counts = {
                 "device_id": df.filter(df["device_id"].isNull()).count(),
                 "date": df.filter(df["date"].isNull()).count()
@@ -390,6 +419,14 @@ def write_batch_to_postgres(batch_df, table, batch_id):
             logger.warning(f"Batch {batch_id} is empty, skipping write to {table}")
             return False
         
+        # Ensure date/timestamp columns are proper types for Postgres
+        for dt_col in ["date"]:
+            if dt_col in batch_df.columns:
+                batch_df = batch_df.withColumn(dt_col, col(dt_col).cast(DateType()))
+        if "processing_timestamp" in batch_df.columns:
+            batch_df = batch_df.withColumn("processing_timestamp", col("processing_timestamp").cast(TimestampType()))
+        
+
         # Log the actual schema being written
         logger.info(f"DataFrame schema for {table}: {batch_df.schema}")
         logger.info(f"DataFrame columns: {batch_df.columns}")
@@ -449,41 +486,38 @@ def process_batch(batch_df, batch_id):
             logger.warning(f"Empty batch {batch_id}, skipping processing")
             return
         
-        # Raw write
+        # 1. Write raw table
         raw_write_success = write_batch_to_postgres(batch_df, POSTGRES_TABLE_RAW, batch_id)
         
         # Only proceed with processing if raw write was successful
         if raw_write_success:
-            # Cleaning
+            # Cleaning, impute, anomaly detect
             cleaned = basic_data_cleaning(batch_df)
-            cleaned_count = cleaned.count()
-            logger.info(f"After cleaning: {cleaned_count} records")
-            
-            # Imputation
             imputed = apply_ml_imputation(cleaned)
-            imputed_count = imputed.count()
-            logger.info(f"After imputation: {imputed_count} records")
-            
-            # Anomaly detection
             flagged = detect_anomalies_simple(imputed)
-            flagged_count = flagged.count()
-            logger.info(f"After anomaly detection: {flagged_count} records")
-            
-            # Aggregation
+
+            # 2. Write individual readings to weather_clean
+            write_batch_to_postgres(flagged, POSTGRES_TABLE_CLEAN, batch_id)
+
+            # 3. Aggregate Daily Metrics
             aggregated = aggregate_daily_data(flagged)
-            aggregated_count = aggregated.count()
-            logger.info(f"After aggregation: {aggregated_count} records")
-            
-            # Clean write
-            clean_write_success = write_batch_to_postgres(aggregated, POSTGRES_TABLE_CLEAN, batch_id)
-            
+
+            # Write aggregated data to daily_agg table
+            write_batch_to_postgres(aggregated, POSTGRES_TABLE_DAILY_AGG, batch_id)
+
+            # ----------- QC-Level-1 ------------
+            qc_checked = qc_check_level1(imputed, thr)
+
+            # QC write
+            write_batch_to_postgres(qc_checked, POSTGRES_TABLE_QC_AUDIT_LOG, batch_id)
+           
             # Record metrics
             processing_time = time.time() - start_time
-            logger.info(f"Batch {batch_id} processing metrics: count={batch_count}, time={processing_time:.2f}s, " +
-                        f"rate={batch_count/processing_time:.2f} records/s, " +
-                        f"raw_write={raw_write_success}, clean_write={clean_write_success}")
+            logger.info(f"Batch {batch_id} processed in {processing_time:.2f}s")
+            
         else:
             logger.warning(f"Skipping further processing for batch {batch_id} due to raw write failure")
+
     except Exception as e:
         logger.error(f"Error processing batch {batch_id}: {str(e)}")
         logger.error(traceback.format_exc())
@@ -512,7 +546,7 @@ def verify_postgres_tables():
         try:
             clean_df = spark.read.format("jdbc") \
                 .option("url", jdbc_url) \
-                .option("dbtable", f"(SELECT * FROM {POSTGRES_TABLE_CLEAN} LIMIT 0) as tmp") \
+                .option("dbtable", f"(SELECT * FROM {POSTGRES_TABLE_DAILY_AGG} LIMIT 0) as tmp") \
                 .load()
             logger.info(f"Clean table schema: {clean_df.schema.simpleString()}")
         except Exception as e:

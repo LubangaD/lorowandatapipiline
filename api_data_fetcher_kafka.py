@@ -47,27 +47,32 @@ def login_and_get_token(email, password):
 def get_readings(access_token, producer):
     """Get readings data using the access token and send to Kafka."""
     headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(READINGS_URL, headers=headers)
+    params = {
+        "start": "2024-04-20T00:00:00Z"   # fetch everything from April 20 onwards
+    }
+    response = requests.get(READINGS_URL, headers=headers, params=params)
     
     if response.status_code == 200:
         data = response.json()
         df = pd.DataFrame(data)
         print("Data retrieved successfully.")
-        print(df.head())  # Show first few rows
+        print(df.head())
         
         # Send data to Kafka
         for index, row in df.iterrows():
             record = row.to_dict()
             try:
-                producer.produce(KAFKA_TOPIC, 
-                                 key=str(index), 
-                                 value=json.dumps(record).encode('utf-8'), 
-                                 callback=delivery_report)
-                producer.poll(0)  # Serve delivery callback queue
+                producer.produce(
+                    KAFKA_TOPIC,
+                    key=str(index),
+                    value=json.dumps(record).encode('utf-8'),
+                    callback=delivery_report
+                )
+                producer.poll(0)
             except Exception as e:
                 print(f"Failed to produce message: {e}")
         
-        producer.flush()  # Wait for all messages to be delivered
+        producer.flush()
         print(f"Data sent to Kafka topic: {KAFKA_TOPIC}\n")
         return True
     else:
